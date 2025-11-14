@@ -551,4 +551,246 @@ class CodeVersioningPlugin(Plugin):
             diff=initial_diff,
             content=content
         )
-        db.add(v
+        db.add(version)
+    
+    async def _check_and_track(
+        self, 
+        node_id: str, 
+        db: AsyncSession
+    ) -> Optional[CodeVersion]:
+        """Check if node changed and track new version"""
+        from sqlalchemy import select
+        
+        # Get tracking node
+        stmt = select(CodeVersionNode).where(CodeVersionNode.node_id == node_id)
+        result = await db.execute(stmt)
+        tracking_node = result.scalar_one_or_none()
+        
+        if not tracking_node:
+            return None
+        
+        if not self.vc_service.file_exists(tracking_node.file_path):
+            return None
+        
+        # Check if changed
+        current_content = self.vc_service.get_file_content(tracking_node.file_path)
+        current_hash = self.vc_service.compute_file_hash(current_content)
+        
+        if tracking_node.current_hash == current_hash:
+            return None
+        
+        # Get previous version
+        prev_version = await self._get_latest_version(tracking_node.id, db)
+        prev_content = prev_version.content if prev_version else ""
+        
+        # Generate diff and create new version
+        diff = self.vc_service.generate_unified_diff(prev_content, current_content)
+        version = CodeVersion(
+            tracking_node_id=tracking_node.id,
+            content_hash=current_hash,
+            diff=diff,
+            content=current_content
+        )
+        db.add(version)
+        
+        # Update tracking node
+        tracking_node.current_hash = current_hash
+        tracking_node.last_updated = datetime.utcnow()
+        
+        return version
+    
+    async def _get_latest_version(
+        self, 
+        tracking_node_id: str, 
+        db: AsyncSession
+    ) -> Optional[CodeVersion]:
+        """Get latest version for a tracking node"""
+        from sqlalchemy import select
+        stmt = select(CodeVersion).where(
+            CodeVersion.tracking_node_id == tracking_node_id
+        ).order_by(CodeVersion.created_at.desc()).limit(1)
+        
+        result = await db.execute(stmt)
+        return result.scalar_one_or_none()
+    
+    async def _get_node_history(
+        self, 
+        node_id: str, 
+        db: AsyncSession
+    ) -> List[CodeVersion]:
+        """Get all versions for a node"""
+        from sqlalchemy import select
+        
+        stmt = select(CodeVersionNode).where(CodeVersionNode.node_id == node_id)
+        result = await db.execute(stmt)
+        tracking_node = result.scalar_one_or_none()
+        
+        if not tracking_node:
+            return []
+        
+        stmt = select(CodeVersion).where(
+            CodeVersion.tracking_node_id == tracking_node.id
+        ).order_by(CodeVersion.created_at.desc())
+        
+        result = await db.execute(stmt)
+        return result.scalars().all()
+    
+    async def _get_version_by_id(
+        self, 
+        version_id: str, 
+        db: AsyncSession
+    ) -> Optional[CodeVersion]:
+        """Get version by ID"""
+        return await db.get(CodeVersion, version_id)
+
+
+# ============================================================================
+# MAIN APPLICATION WITH EVENT-DRIVEN PLUGIN SYSTEM
+# ============================================================================
+
+app = FastAPI(title="DAG Execution System with Event-Driven Plugins")
+
+# Initialize plugin manager
+plugin_manager = PluginManager(app)
+app.state.plugin_manager = plugin_manager
+
+@app.on_event("startup")
+async def startup():
+    """Register plugins and start event processor on startup"""
+    # Start event processor
+    await plugin_manager.start_event_processor()
+    
+    # Register Code Versioning Plugin
+    code_versioning_config = {
+        'base_path': '/app/dag_files'
+    }
+    code_versioning_plugin = CodeVersioningPlugin(app, code_versioning_config)
+    await plugin_manager.register_plugin(
+        code_versioning_plugin,
+        prefix="/api/v1/code-versioning"
+    )
+    
+    print("✓ Event-driven plugin system started")
+
+@app.on_event("shutdown")
+async def shutdown():
+    """Unregister all plugins and stop event processor on shutdown"""
+    # Unregister plugins
+    for plugin_name in list(plugin_manager.plugins.keys()):
+        await plugin_manager.unregister_plugin(plugin_name)
+    
+    # Stop event processor
+    await plugin_manager.stop_event_processor()
+    
+    print("✓ Event-driven plugin system stopped")
+
+# Plugin management endpoints
+@app.get("/plugins")
+async def list_plugins():
+    """List all registered plugins"""
+    return plugin_manager.list_plugins()
+
+@app.get("/plugins/{plugin_name}")
+async def get_plugin_info(plugin_name: str):
+    """Get information about a specific plugin"""
+    plugin = plugin_manager.get_plugin(plugin_name)
+    if not plugin:
+        raise HTTPException(status_code=404, detail="Plugin not found")
+    return {
+        "name": plugin.name,
+        "version": plugin.version,
+        "config": plugin.config
+    }
+
+# ============================================================================
+# YOUR EXISTING DAG ENDPOINTS (No changes needed!)
+# ============================================================================
+
+@app.post("/nodes")
+async def create_node(
+    name: str, 
+    file_path: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """Create a node - events are automatically triggered!"""
+    node = Node(
+        name=name,
+        file_path=file_path
+    )
+    db.add(node)
+    await db.commit()
+    await db.refresh(node)
+    
+    # SQLAlchemy events automatically trigger plugin hooks!
+    return {
+        "id": node.id,
+        "name": node.name,
+        "file_path": node.file_path,
+        "message": "Node created (plugins notified automatically)"
+    }
+
+@app.put("/nodes/{node_id}")
+async def update_node(
+    node_id: str,
+    name: Optional[str] = None,
+    file_path: Optional[str] = None,
+    db: AsyncSession = Depends(get_db)
+):
+    """Update a node - events are automatically triggered!"""
+    node = await db.get(Node, node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Node not found")
+    
+    if name:
+        node.name = name
+    if file_path:
+        node.file_path = file_path
+    
+    node.updated_at = datetime.utcnow()
+    await db.commit()
+    
+    # SQLAlchemy events automatically trigger plugin hooks!
+    return {
+        "id": node.id,
+        "updated": True,
+        "message": "Node updated (plugins notified automatically)"
+    }
+
+@app.delete("/nodes/{node_id}")
+async def delete_node(
+    node_id: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """Delete a node - events are automatically triggered!"""
+    node = await db.get(Node, node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Node not found")
+    
+    await db.delete(node)
+    await db.commit()
+    
+    # SQLAlchemy events automatically trigger plugin hooks!
+    return {
+        "id": node_id,
+        "deleted": True,
+        "message": "Node deleted (plugins notified automatically)"
+    }
+
+@app.get("/nodes")
+async def list_nodes(db: AsyncSession = Depends(get_db)):
+    """List all nodes"""
+    from sqlalchemy import select
+    stmt = select(Node)
+    result = await db.execute(stmt)
+    nodes = result.scalars().all()
+    
+    return [
+        {
+            "id": n.id,
+            "name": n.name,
+            "file_path": n.file_path,
+            "created_at": n.created_at,
+            "updated_at": n.updated_at
+        }
+        for n in nodes
+    ]
