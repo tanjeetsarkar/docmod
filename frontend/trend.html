@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Variable Analysis Dashboard</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/echarts/5.4.3/echarts.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/echarts-gl/2.0.9/echarts-gl.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 20px;
+            min-height: 100vh;
+        }
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+        }
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        .header h1 {
+            font-size: 28px;
+            margin-bottom: 10px;
+        }
+        .header p {
+            opacity: 0.9;
+            font-size: 14px;
+        }
+        .controls {
+            padding: 20px 30px;
+            background: #f8f9fa;
+            border-bottom: 2px solid #e9ecef;
+            display: flex;
+            gap: 20px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+        .control-group {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+        .control-group label {
+            font-size: 12px;
+            font-weight: 600;
+            color: #495057;
+            text-transform: uppercase;
+        }
+        .control-group select, .control-group button {
+            padding: 8px 15px;
+            border: 2px solid #dee2e6;
+            border-radius: 6px;
+            font-size: 14px;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        .control-group select:hover, .control-group button:hover {
+            border-color: #667eea;
+        }
+        .control-group button {
+            background: #667eea;
+            color: white;
+            border: none;
+            font-weight: 600;
+        }
+        .control-group button:hover {
+            background: #5568d3;
+            transform: translateY(-1px);
+        }
+        .control-group button.active {
+            background: #28a745;
+        }
+        .chart-container {
+            padding: 30px;
+        }
+        #main-chart {
+            width: 100%;
+            height: 700px;
+        }
+        .legend {
+            padding: 20px 30px;
+            background: #f8f9fa;
+            border-top: 2px solid #e9ecef;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+        }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 13px;
+        }
+        .legend-color {
+            width: 20px;
+            height: 20px;
+            border-radius: 4px;
+        }
+        .info-panel {
+            padding: 20px 30px;
+            background: #fff3cd;
+            border-top: 2px solid #ffc107;
+            font-size: 13px;
+            color: #856404;
+        }
+        .info-panel strong {
+            color: #533f03;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>📊 3D Variable Analysis Dashboard</h1>
+            <p>Interactive visualization of Information Value (IV), Variable Drift Index (VDI), and Temporal Trends</p>
+        </div>
+        
+        <div class="controls">
+            <div class="control-group">
+                <label>Z-Axis Metric</label>
+                <select id="z-axis-select">
+                    <option value="trend">VDI Trend Slope</option>
+                    <option value="latest">Latest VDI</option>
+                    <option value="bins">Number of Bins</option>
+                </select>
+            </div>
+            <div class="control-group">
+                <label>Show Trend Lines</label>
+                <button id="toggle-trends" class="active">ON</button>
+            </div>
+            <div class="control-group">
+                <label>Highlight Variable</label>
+                <select id="variable-select">
+                    <option value="">All Variables</option>
+                </select>
+            </div>
+            <div class="control-group">
+                <label>View Preset</label>
+                <button id="reset-view">Reset View</button>
+            </div>
+        </div>
+        
+        <div class="chart-container">
+            <div id="main-chart"></div>
+        </div>
+        
+        <div class="legend">
+            <div class="legend-item">
+                <div class="legend-color" style="background: #ff4444;"></div>
+                <span><strong>High Risk:</strong> High IV + High VDI</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #ffaa00;"></div>
+                <span><strong>Monitor:</strong> High IV + Medium VDI</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #00cc66;"></div>
+                <span><strong>Stable:</strong> High IV + Low VDI</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #888888;"></div>
+                <span><strong>Low Value:</strong> Low IV</span>
+            </div>
+        </div>
+        
+        <div class="info-panel">
+            <strong>💡 How to use:</strong> Rotate the chart by dragging. Zoom with mouse wheel. Click variables in the dropdown to highlight their trend over time. 
+            X-axis shows Information Value (predictive power), Y-axis shows Max VDI (drift magnitude), Z-axis shows your selected metric.
+        </div>
+    </div>
+
+    <script>
+        // Generate sample data
+        const variables = [
+            'Age', 'Income', 'Credit_Score', 'Loan_Amount', 'Employment_Years',
+            'Debt_Ratio', 'Property_Value', 'Monthly_Payment', 'Account_Age',
+            'Transaction_Count', 'Average_Balance', 'Payment_History'
+        ];
+
+        const timeIntervals = ['T1_Jan', 'T2_Feb', 'T3_Mar', 'T4_Apr', 'T5_May', 'T6_Jun'];
+
+        // Generate data for each variable
+        const data = variables.map((varName, idx) => {
+            const baseIV = 0.05 + Math.random() * 0.35;
+            const baseDrift = Math.random() * 0.25;
+            const numBins = Math.floor(5 + Math.random() * 10);
+            
+            // Generate VDI over time
+            const vdiOverTime = timeIntervals.map((t, i) => {
+                return baseDrift + (Math.random() - 0.5) * 0.1 + (i * 0.01);
+            });
+            
+            // Calculate trend slope
+            const n = vdiOverTime.length;
+            const xMean = (n - 1) / 2;
+            const yMean = vdiOverTime.reduce((a, b) => a + b) / n;
+            let numerator = 0, denominator = 0;
+            
+            vdiOverTime.forEach((y, x) => {
+                numerator += (x - xMean) * (y - yMean);
+                denominator += Math.pow(x - xMean, 2);
+            });
+            
+            const trendSlope = numerator / denominator;
+            const maxVDI = Math.max(...vdiOverTime);
+            const latestVDI = vdiOverTime[vdiOverTime.length - 1];
+            
+            return {
+                name: varName,
+                iv: baseIV,
+                maxVDI: maxVDI,
+                latestVDI: latestVDI,
+                trendSlope: trendSlope,
+                bins: numBins,
+                vdiOverTime: vdiOverTime,
+                timeIntervals: timeIntervals
+            };
+        });
+
+        // Populate variable select
+        const variableSelect = document.getElementById('variable-select');
+        variables.forEach(v => {
+            const option = document.createElement('option');
+            option.value = v;
+            option.textContent = v;
+            variableSelect.appendChild(option);
+        });
+
+        // Initialize chart
+        const chart = echarts.init(document.getElementById('main-chart'));
+        let showTrends = true;
+        let selectedVariable = '';
+        let zAxisMetric = 'trend';
+
+        function getColor(iv, maxVDI) {
+            if (iv > 0.1 && maxVDI > 0.15) return '#ff4444'; // High risk
+            if (iv > 0.1 && maxVDI > 0.08) return '#ffaa00'; // Monitor
+            if (iv > 0.1) return '#00cc66'; // Stable
+            return '#888888'; // Low value
+        }
+
+        function getZValue(item, metric) {
+            switch(metric) {
+                case 'trend': return item.trendSlope;
+                case 'latest': return item.latestVDI;
+                case 'bins': return item.bins / 100; // Scale down for visualization
+                default: return item.trendSlope;
+            }
+        }
+
+        function updateChart() {
+            const scatterData = data.map(item => {
+                const color = getColor(item.iv, item.maxVDI);
+                const zValue = getZValue(item, zAxisMetric);
+                const opacity = selectedVariable === '' || selectedVariable === item.name ? 1 : 0.2;
+                
+                return {
+                    name: item.name,
+                    value: [item.iv, item.maxVDI, zValue],
+                    itemStyle: {
+                        color: color,
+                        opacity: opacity
+                    },
+                    symbolSize: 12,
+                    label: {
+                        show: selectedVariable === item.name,
+                        formatter: item.name,
+                        position: 'top',
+                        fontSize: 12,
+                        fontWeight: 'bold'
+                    }
+                };
+            });
+
+            // Create trend lines
+            const trendLines = [];
+            if (showTrends) {
+                data.forEach(item => {
+                    if (selectedVariable === '' || selectedVariable === item.name) {
+                        const lineData = item.vdiOverTime.map((vdi, idx) => {
+                            const timeProgress = idx / (item.vdiOverTime.length - 1);
+                            const zValue = getZValue(item, zAxisMetric);
+                            return [item.iv, vdi, zValue * (0.5 + timeProgress * 0.5)];
+                        });
+                        
+                        trendLines.push({
+                            type: 'line3D',
+                            name: item.name + '_trend',
+                            data: lineData,
+                            lineStyle: {
+                                color: getColor(item.iv, item.maxVDI),
+                                width: selectedVariable === item.name ? 3 : 1,
+                                opacity: selectedVariable === item.name ? 0.8 : 0.3
+                            }
+                        });
+                    }
+                });
+            }
+
+            const zAxisLabel = {
+                'trend': 'VDI Trend Slope',
+                'latest': 'Latest VDI',
+                'bins': 'Number of Bins (scaled)'
+            }[zAxisMetric];
+
+            const option = {
+                tooltip: {
+                    formatter: (params) => {
+                        if (params.componentSubType === 'scatter3D') {
+                            const item = data.find(d => d.name === params.name);
+                            return `
+                                <strong>${params.name}</strong><br/>
+                                IV: ${item.iv.toFixed(3)}<br/>
+                                Max VDI: ${item.maxVDI.toFixed(3)}<br/>
+                                Latest VDI: ${item.latestVDI.toFixed(3)}<br/>
+                                Trend Slope: ${item.trendSlope.toFixed(4)}<br/>
+                                Bins: ${item.bins}
+                            `;
+                        }
+                        return '';
+                    }
+                },
+                grid3D: {
+                    viewControl: {
+                        projection: 'perspective',
+                        autoRotate: false,
+                        distance: 200,
+                        alpha: 25,
+                        beta: 30,
+                        minAlpha: -90,
+                        maxAlpha: 90
+                    },
+                    boxWidth: 100,
+                    boxDepth: 80,
+                    boxHeight: 80,
+                    light: {
+                        main: {
+                            intensity: 1.2,
+                            shadow: true
+                        },
+                        ambient: {
+                            intensity: 0.3
+                        }
+                    }
+                },
+                xAxis3D: {
+                    name: 'Information Value (IV)',
+                    nameTextStyle: { fontSize: 14, fontWeight: 'bold' },
+                    min: 0,
+                    max: 'dataMax'
+                },
+                yAxis3D: {
+                    name: 'Max VDI',
+                    nameTextStyle: { fontSize: 14, fontWeight: 'bold' },
+                    min: 0,
+                    max: 'dataMax'
+                },
+                zAxis3D: {
+                    name: zAxisLabel,
+                    nameTextStyle: { fontSize: 14, fontWeight: 'bold' }
+                },
+                series: [
+                    {
+                        type: 'scatter3D',
+                        data: scatterData,
+                        symbolSize: 12,
+                        emphasis: {
+                            itemStyle: {
+                                borderColor: '#000',
+                                borderWidth: 2
+                            }
+                        }
+                    },
+                    ...trendLines
+                ]
+            };
+
+            chart.setOption(option, true);
+        }
+
+        // Event listeners
+        document.getElementById('toggle-trends').addEventListener('click', (e) => {
+            showTrends = !showTrends;
+            e.target.textContent = showTrends ? 'ON' : 'OFF';
+            e.target.classList.toggle('active', showTrends);
+            updateChart();
+        });
+
+        document.getElementById('variable-select').addEventListener('change', (e) => {
+            selectedVariable = e.target.value;
+            updateChart();
+        });
+
+        document.getElementById('z-axis-select').addEventListener('change', (e) => {
+            zAxisMetric = e.target.value;
+            updateChart();
+        });
+
+        document.getElementById('reset-view').addEventListener('click', () => {
+            chart.setOption({
+                grid3D: {
+                    viewControl: {
+                        alpha: 25,
+                        beta: 30,
+                        distance: 200
+                    }
+                }
+            });
+        });
+
+        // Handle window resize
+        window.addEventListener('resize', () => {
+            chart.resize();
+        });
+
+        // Initial render
+        updateChart();
+    </script>
+</body>
+</html>
