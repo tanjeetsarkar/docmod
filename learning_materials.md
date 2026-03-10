@@ -1,21 +1,3 @@
-Web Application Architecture Learning Path
-
-A compact guide to understanding how modern web systems work (FastAPI + Next.js + Postgres + Redis + Kubernetes on GCP)
-
-This document provides a concept-first learning path for senior engineers who want to understand how web applications work end-to-end.
-
-The goal is not framework tutorials but understanding the systems underneath them.
-Frameworks like FastAPI or Next.js are used only as examples of where concepts apply.
-
-Each section includes:
-
-- A short concept explanation
-- Key topics to understand
-- High-quality learning materials
-- A quick start guide where applicable
-
----
-
 1. Web Fundamentals (Client ↔ Server)
 
 Explanation
