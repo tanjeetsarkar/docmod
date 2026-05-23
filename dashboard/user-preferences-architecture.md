@@ -635,3 +635,721 @@ export function usePreference(prefKey, defaultValue) {
     }
 
     // L2: Write to Apollo cache — other components in same session update too
+client.writeQuery({
+      query: GetUserPreferencesDocument,
+      variables: { keys: [prefKey] },
+      data: {
+        userPreferences: [{ __typename: 'UserPreference', key: prefKey, value: newValue }],
+      },
+    })
+
+    // L3: Debounced write to PostgreSQL via GraphQL mutation
+    // Debounce: don't fire a mutation for every keystroke or drag event
+    // Only persist after user stops making changes for 800ms
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
+    saveTimerRef.current = setTimeout(async () => {
+      try {
+        await saveMutation({ variables: { key: prefKey, value: newValue } })
+      } catch (err) {
+        // Server save failed — localStorage still has the value
+        // User won't notice unless they switch devices
+        console.error(`[Preferences] Server save failed for ${prefKey}:`, err)
+      }
+    }, 800)
+  }, [lsKey, prefKey, client, saveMutation])
+
+  // ─── Reset ───────────────────────────────────────────────────────────────
+
+  const reset = useCallback(async () => {
+    // Clear L1
+    localStorage.removeItem(lsKey)
+
+    // Clear L2
+    client.writeQuery({
+      query: GetUserPreferencesDocument,
+      variables: { keys: [prefKey] },
+      data: { userPreferences: [] },
+    })
+
+    // Clear L3
+    try {
+      await client.mutate({
+        mutation: ResetPreferenceDocument,
+        variables: { key: prefKey },
+      })
+    } catch (err) {
+      console.error(`[Preferences] Reset failed for ${prefKey}:`, err)
+    }
+  }, [lsKey, prefKey, client])
+
+  // Cleanup debounce timer on unmount
+  useEffect(() => {
+    return () => {
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
+    }
+  }, [])
+
+  return { value, save, reset }
+}
+```
+
+### Batch Load Hook — Page-Level Preference Loading
+
+Use this on page mount to fetch all preferences for the page in one network call:
+
+```javascript
+// src/hooks/usePagePreferences.js
+
+import { useQuery } from '@apollo/client'
+import { GetUserPreferencesDocument } from '../generated/graphql'
+
+/**
+ * Fetch all preferences for a page in one query.
+ * Call this once at the page level, pass values down to components.
+ *
+ * @param {string[]} keys - All preference keys the page needs
+ */
+export function usePagePreferences(keys) {
+  const { data, loading } = useQuery(GetUserPreferencesDocument, {
+    variables: { keys },
+    // Preferences rarely change server-side — aggressive caching is fine
+    fetchPolicy:     'cache-first',
+    nextFetchPolicy: 'cache-only',
+  })
+
+  const preferences = {}
+  if (data?.userPreferences) {
+    data.userPreferences.forEach(p => {
+      preferences[p.key] = p.value
+    })
+  }
+
+  return { preferences, loading }
+}
+```
+
+---
+
+## 8. Optimistic Updates — Instant Feedback
+
+The debounce in `usePreference.save()` handles the async server write. But there is a subtlety: what if the server write fails? The UI already applied the change. Here is the full strategy:
+
+### Why This Is Acceptable
+
+Preferences are low-stakes. If a column visibility change fails to persist to the server, the user:
+1. **Sees** the correct UI immediately (localStorage applied it)
+2. **Keeps** the preference for this session (localStorage + Apollo cache)
+3. **Loses** the preference only if they switch devices before the next successful sync
+
+This tradeoff is correct for display preferences. It would not be correct for transactional data.
+
+### Retry on Failure
+
+```javascript
+// Extend the save function with retry logic
+
+const save = useCallback((newValue) => {
+  // L1 + L2 writes (same as before) ...
+
+  // L3: Debounced with retry
+  if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
+  saveTimerRef.current = setTimeout(() => {
+    saveWithRetry(prefKey, newValue, saveMutation, retries = 3)
+  }, 800)
+}, [])
+
+
+async function saveWithRetry(prefKey, value, mutation, retries) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      await mutation({ variables: { key: prefKey, value } })
+      return    // success — stop retrying
+    } catch (err) {
+      if (attempt === retries) {
+        // All retries exhausted — show a subtle toast
+        // localStorage still has the value for this session
+        showToast({
+          message: 'Your preference could not be saved to the server.',
+          type: 'warning',
+          action: { label: 'Retry', onClick: () => saveWithRetry(prefKey, value, mutation, 1) }
+        })
+      } else {
+        // Exponential backoff: 1s, 2s, 4s
+        await sleep(1000 * Math.pow(2, attempt - 1))
+      }
+    }
+  }
+}
+```
+
+---
+
+## 9. Component Integration
+
+### Column Visibility — Table Component
+
+```javascript
+// src/preferences/defaults.js
+
+// Default values when user has no saved preference
+export const DEFAULTS = {
+  REGIONAL_DETAILS_COLUMNS: {
+    visible: ['modelName', 'country', 'gini', 'psi'],
+    hidden:  [],
+    order:   ['modelName', 'country', 'gini', 'psi'],
+  },
+  DEEP_DIVE_GINI_CONFIG: {
+    xAxis:     'runDate',
+    yAxis:     'giniValue',
+    chartType: 'line',
+    colors: {
+      RED:   '#ef4444',
+      AMBER: '#f59e0b',
+      GREEN: '#22c55e',
+      line:  '#6366f1',
+    },
+  },
+}
+```
+
+```jsx
+// src/components/ModelMetricsTable/ModelMetricsTable.jsx
+
+import { useState } from 'react'
+import { usePreference } from '../../hooks/usePreference'
+import { PrefKey }       from '../../preferences/keys'
+import { DEFAULTS }      from '../../preferences/defaults'
+import ColumnVisibilityPanel from './ColumnVisibilityPanel'
+
+// Define all possible columns — this is the source of truth for the table
+const ALL_COLUMNS = [
+  { id: 'modelName',  label: 'Model Name',  required: true  },   // required: can't hide
+  { id: 'country',    label: 'Country',     required: true  },
+  { id: 'gini',       label: 'Gini',        required: false },
+  { id: 'psi',        label: 'PSI',         required: false },
+  { id: 'ks',         label: 'KS Stat',     required: false },
+  { id: 'runDate',    label: 'Run Date',    required: false },
+  { id: 'threshold',  label: 'Threshold',  required: false },
+]
+
+function ModelMetricsTable({ models }) {
+  const [panelOpen, setPanelOpen] = useState(false)
+
+  const { value: colPref, save: saveColPref, reset: resetColPref } = usePreference(
+    PrefKey.REGIONAL_DETAILS_COLUMNS,
+    DEFAULTS.REGIONAL_DETAILS_COLUMNS,
+  )
+
+  // Derive visible columns from preference — required columns always show
+  const visibleColumns = ALL_COLUMNS.filter(col =>
+    col.required || colPref.visible.includes(col.id)
+  )
+
+  // Sort by user-defined order
+  const orderedColumns = colPref.order
+    .map(id => visibleColumns.find(c => c.id === id))
+    .filter(Boolean)
+    .concat(visibleColumns.filter(c => !colPref.order.includes(c.id)))
+
+  function handleToggleColumn(columnId) {
+    const currentVisible = colPref.visible
+    const isVisible = currentVisible.includes(columnId)
+
+    const newVisible = isVisible
+      ? currentVisible.filter(id => id !== columnId)
+      : [...currentVisible, columnId]
+
+    // save() writes to localStorage immediately, server asynchronously
+    saveColPref({ ...colPref, visible: newVisible })
+  }
+
+  function handleReorderColumns(newOrder) {
+    saveColPref({ ...colPref, order: newOrder })
+  }
+
+  return (
+    <div>
+      {/* Column control trigger */}
+      <button onClick={() => setPanelOpen(true)}>
+        Columns ({visibleColumns.length}/{ALL_COLUMNS.length})
+      </button>
+
+      {panelOpen && (
+        <ColumnVisibilityPanel
+          allColumns={ALL_COLUMNS}
+          colPref={colPref}
+          onToggle={handleToggleColumn}
+          onReorder={handleReorderColumns}
+          onReset={resetColPref}
+          onClose={() => setPanelOpen(false)}
+        />
+      )}
+
+      <table>
+        <thead>
+          <tr>
+            {orderedColumns.map(col => (
+              <th key={col.id}>{col.label}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {models.map(model => (
+            <ModelMetricRow
+              key={model.modelId}
+              model={model}
+              visibleColumns={orderedColumns.map(c => c.id)}
+            />
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+export default ModelMetricsTable
+```
+
+```jsx
+// src/components/ModelMetricsTable/ColumnVisibilityPanel.jsx
+
+function ColumnVisibilityPanel({ allColumns, colPref, onToggle, onReorder, onReset, onClose }) {
+  return (
+    <div className="column-panel">
+      <div className="panel-header">
+        <h3>Show / Hide Columns</h3>
+        <button onClick={onReset}>Reset to Default</button>
+        <button onClick={onClose}>✕</button>
+      </div>
+
+      <ul className="column-list">
+        {allColumns.map(col => (
+          <li key={col.id} className="column-item">
+            {/* Drag handle for reordering — wire to your DnD library */}
+            <span className="drag-handle">⠿</span>
+
+            <input
+              type="checkbox"
+              id={`col-${col.id}`}
+              checked={col.required || colPref.visible.includes(col.id)}
+              disabled={col.required}
+              onChange={() => onToggle(col.id)}
+            />
+            <label htmlFor={`col-${col.id}`}>{col.label}</label>
+
+            {col.required && (
+              <span className="required-badge">Required</span>
+            )}
+          </li>
+        ))}
+      </ul>
+    </div>
+  )
+}
+```
+
+### Chart Configuration — Deep Dive
+
+```jsx
+// src/components/MetricChart/MetricChart.jsx
+
+import { useState } from 'react'
+import { usePreference } from '../../hooks/usePreference'
+import { PrefKey }       from '../../preferences/keys'
+import { DEFAULTS }      from '../../preferences/defaults'
+import ChartConfigPanel  from './ChartConfigPanel'
+
+const AXIS_OPTIONS = [
+  { value: 'runDate',     label: 'Run Date' },
+  { value: 'giniValue',   label: 'Gini Score' },
+  { value: 'threshold',   label: 'Threshold' },
+  { value: 'sampleSize',  label: 'Sample Size' },
+]
+
+const CHART_TYPES = ['line', 'bar', 'area']
+
+function MetricChart({ metric, data }) {
+  const [configOpen, setConfigOpen] = useState(false)
+
+  const prefKey = PrefKey.chart_config('deep_dive', `${metric}_history`)
+  const defaultConfig = DEFAULTS.DEEP_DIVE_GINI_CONFIG
+
+  const { value: chartConfig, save: saveChartConfig, reset: resetChartConfig } =
+    usePreference(prefKey, defaultConfig)
+
+  function handleConfigChange(field, value) {
+    // Each field change is debounced — no mutation spam
+    saveChartConfig({ ...chartConfig, [field]: value })
+  }
+
+  function handleColorChange(statusKey, color) {
+    saveChartConfig({
+      ...chartConfig,
+      colors: { ...chartConfig.colors, [statusKey]: color },
+    })
+  }
+
+  return (
+    <div className="chart-container">
+      <div className="chart-toolbar">
+        <span className="chart-title">{metric.toUpperCase()} History</span>
+        <button onClick={() => setConfigOpen(!configOpen)}>⚙ Configure</button>
+        <button onClick={resetChartConfig}>Reset</button>
+      </div>
+
+      {configOpen && (
+        <ChartConfigPanel
+          config={chartConfig}
+          axisOptions={AXIS_OPTIONS}
+          chartTypes={CHART_TYPES}
+          onAxisChange={(axis, value) => handleConfigChange(axis, value)}
+          onColorChange={handleColorChange}
+          onChartTypeChange={(type) => handleConfigChange('chartType', type)}
+        />
+      )}
+
+      {/* Your charting library (Recharts, Chart.js, etc.) */}
+      <ChartRenderer
+        data={data}
+        xAxis={chartConfig.xAxis}
+        yAxis={chartConfig.yAxis}
+        chartType={chartConfig.chartType}
+        colors={chartConfig.colors}
+      />
+    </div>
+  )
+}
+
+export default MetricChart
+```
+
+```jsx
+// src/components/MetricChart/ChartConfigPanel.jsx
+
+function ChartConfigPanel({ config, axisOptions, chartTypes, onAxisChange, onColorChange, onChartTypeChange }) {
+  return (
+    <div className="config-panel">
+
+      {/* Axis Selection */}
+      <div className="config-section">
+        <label>X Axis</label>
+        <select
+          value={config.xAxis}
+          onChange={e => onAxisChange('xAxis', e.target.value)}
+        >
+          {axisOptions.map(opt => (
+            <option key={opt.value} value={opt.value}>{opt.label}</option>
+          ))}
+        </select>
+      </div>
+
+      <div className="config-section">
+        <label>Y Axis</label>
+        <select
+          value={config.yAxis}
+          onChange={e => onAxisChange('yAxis', e.target.value)}
+        >
+          {axisOptions.map(opt => (
+            <option key={opt.value} value={opt.value}>{opt.label}</option>
+          ))}
+        </select>
+      </div>
+
+      {/* Chart Type */}
+      <div className="config-section">
+        <label>Chart Type</label>
+        <div className="toggle-group">
+          {chartTypes.map(type => (
+            <button
+              key={type}
+              className={config.chartType === type ? 'active' : ''}
+              onClick={() => onChartTypeChange(type)}
+            >
+              {type}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Color Pickers */}
+      <div className="config-section">
+        <label>Colors</label>
+        {Object.entries(config.colors).map(([key, color]) => (
+          <div key={key} className="color-row">
+            <span className="color-label">{key}</span>
+            <input
+              type="color"
+              value={color}
+              onChange={e => onColorChange(key, e.target.value)}
+            />
+            <span className="color-hex">{color}</span>
+          </div>
+        ))}
+      </div>
+
+    </div>
+  )
+}
+```
+
+---
+
+## 10. Codegen & Fragment Integration
+
+Preferences are queried and mutated just like any other GraphQL operation. They follow the same codegen flow.
+
+```graphql
+# src/preferences/preferences.graphql
+
+fragment UserPreferenceFields on UserPreference {
+  key
+  value
+  updatedAt
+}
+
+query GetUserPreferences($keys: [String!]!) {
+  userPreferences(keys: $keys) {
+    ...UserPreferenceFields
+  }
+}
+
+mutation SavePreference($key: String!, $value: JSON!) {
+  savePreference(key: $key, value: $value) {
+    ...UserPreferenceFields
+  }
+}
+
+mutation SavePreferences($input: SavePreferencesInput!) {
+  savePreferences(input: $input) {
+    ...UserPreferenceFields
+  }
+}
+
+mutation ResetPreference($key: String!) {
+  resetPreference(key: $key)
+}
+```
+
+After `npm run codegen`, these are available as typed imports:
+
+```javascript
+// All generated — never write these by hand
+import {
+  GetUserPreferencesDocument,
+  SavePreferenceDocument,
+  SavePreferencesDocument,
+  ResetPreferenceDocument,
+} from '../generated/graphql'
+```
+
+Apollo's `typePolicies` should key `UserPreference` on its `key` field:
+
+```javascript
+// src/apollo/client.js
+
+cache: new InMemoryCache({
+  typePolicies: {
+    // Existing types ...
+    UserPreference: {
+      keyFields: ['key'],    // cache one entry per preference key per user
+    },
+  },
+}),
+```
+
+---
+
+## 11. Loading Strategy — Zero Layout Shift
+
+The worst experience is a table that renders all columns, then collapses some after preferences load. Here is how to prevent that.
+
+### Three Loading States
+
+```
+State 1: Skeleton
+  localStorage has no value AND server hasn't responded yet
+  → Show a table skeleton (not the actual table)
+  → This state is rare after first session — localStorage usually has the value
+
+State 2: Instant (from localStorage)
+  localStorage has the value
+  → Render immediately with saved preferences
+  → Server call happens in background silently
+
+State 3: Default
+  New user, no localStorage, server returned empty
+  → Render with DEFAULTS — all columns visible, default chart config
+```
+
+```jsx
+// src/pages/RegionalDetails/RegionalDetails.jsx
+
+import { usePagePreferences } from '../../hooks/usePagePreferences'
+import { PrefKey }             from '../../preferences/keys'
+import { DEFAULTS }            from '../../preferences/defaults'
+
+function RegionalDetails() {
+  const { filters } = useFilterState()
+
+  // Fetch all preferences for this page in one query
+  const { preferences, loading: prefsLoading } = usePagePreferences([
+    PrefKey.REGIONAL_DETAILS_COLUMNS,
+  ])
+
+  const { data: tableData, loading: tableLoading } = useQuery(
+    GetRegionalDetailsDocument,
+    { variables: { region: filters.region, country: filters.country, status: filters.status } }
+  )
+
+  // Read from localStorage first — this is synchronous, no loading state needed
+  const localColumns = (() => {
+    try {
+      const raw = localStorage.getItem(`dashboard:pref:${PrefKey.REGIONAL_DETAILS_COLUMNS}`)
+      return raw ? JSON.parse(raw) : null
+    } catch { return null }
+  })()
+
+  // Resolve column config: localStorage → server → default
+  const columnConfig =
+    localColumns ??
+    preferences[PrefKey.REGIONAL_DETAILS_COLUMNS] ??
+    DEFAULTS.REGIONAL_DETAILS_COLUMNS
+
+  // If we have localStorage, render immediately even if table data is loading
+  // If we have neither, show skeleton
+  if (tableLoading && !localColumns) {
+    return <TableSkeleton columns={DEFAULTS.REGIONAL_DETAILS_COLUMNS.visible} />
+  }
+
+  return (
+    <ModelMetricsTable
+      models={tableData?.regionalDetails?.models ?? []}
+      initialColumnConfig={columnConfig}
+    />
+  )
+}
+```
+
+---
+
+## 12. End-to-End Flow
+
+### First Visit (No Saved Preferences)
+
+```
+1. User visits /regional-details?region=APAC&country=SG&status=total
+
+2. RegionalDetails mounts
+   → localStorage.getItem('dashboard:pref:table:regional_details:...') → null
+   → usePagePreferences fires GetUserPreferences query
+
+3. Apollo → GraphQL → PreferenceService.get_many()
+   → Redis: MISS
+   → PostgreSQL: no rows for this user + key
+   → returns {}
+
+4. columnConfig = DEFAULTS.REGIONAL_DETAILS_COLUMNS
+   → table renders with all default columns
+
+5. User hides "Run Date" column via ColumnVisibilityPanel
+   → handleToggleColumn('runDate')
+   → saveColPref({ visible: ['modelName','country','gini','psi'], hidden: ['runDate'] })
+   → localStorage.setItem(...)       ← instant
+   → Apollo cache.writeQuery(...)    ← instant, table re-renders
+   → setTimeout 800ms ...
+   → saveMutation fires              ← async, user does not wait
+
+6. Server receives SavePreference mutation
+   → PreferenceService.save()
+   → PostgreSQL upsert               ← written to DB
+   → Redis invalidated
+   → returns saved value
+```
+
+### Returning Session (Same Browser)
+
+```
+1. User visits /regional-details again
+
+2. RegionalDetails mounts
+   → localStorage.getItem('dashboard:pref:...') → { visible: [...], hidden: ['runDate'] }
+   → columnConfig = localStorage value
+   → table renders INSTANTLY with correct columns
+   → NO skeleton, NO layout shift
+
+3. GetUserPreferences query fires in background (fetchPolicy: cache-first)
+   → Confirms server value matches localStorage
+   → No re-render needed
+```
+
+### New Device (Cross-Device Persistence)
+
+```
+1. User opens dashboard on new device / incognito
+
+2. RegionalDetails mounts
+   → localStorage.getItem(...) → null  (fresh browser)
+   → usePagePreferences fires query
+
+3. Apollo → GraphQL → PreferenceService.get_many()
+   → Redis: MISS (cold cache on this server instance)
+   → PostgreSQL: FOUND — { visible: [...], hidden: ['runDate'] }
+   → Stored in Redis (TTL 1 hour)
+   → returned to client
+
+4. columnConfig = server value
+   → table renders with user's saved preferences
+   → localStorage.setItem(...) written as L1 cache for future visits
+```
+
+---
+
+## 13. Quick Reference
+
+### State Storage Decision Tree
+
+```
+Is this state part of navigation / filtering?
+  YES → URL params (useFilterState)
+  NO  → Is this a display preference the user configured?
+          YES → usePreference (localStorage + Redis + PostgreSQL)
+          NO  → Is this ephemeral UI state (open/closed panel)?
+                  YES → useState
+                  NO  → Global app state (useContext / Zustand)
+```
+
+### Preference Key Convention
+
+```
+table:{page}:{table_id}:columns       → column visibility + order
+chart:{page}:{chart_id}:config        → axis, chart type, colors
+{page}:layout                         → panel sizes, split ratios (future)
+```
+
+### Files to Create
+
+| File | Purpose |
+|------|---------|
+| `migrations/create_user_preferences.sql` | DB table |
+| `preferences/keys.py` | Backend key constants |
+| `repositories/preference_repo.py` | DB operations (upsert, get_many) |
+| `services/preference_service.py` | Redis + DB orchestration |
+| `resolvers/preferences.py` | GraphQL query + mutations |
+| `src/preferences/keys.js` | Frontend key constants (mirrors backend) |
+| `src/preferences/defaults.js` | Default values per key |
+| `src/hooks/usePreference.js` | Three-layer read/write hook |
+| `src/hooks/usePagePreferences.js` | Page-level batch load hook |
+| `src/preferences/preferences.graphql` | Query + mutation definitions |
+
+### Do / Never
+
+| Do | Never |
+|----|-------|
+| Use `usePreference` for all display config | Store column visibility in URL params |
+| Write localStorage synchronously on change | Wait for server before updating UI |
+| Batch fetch all page preferences on mount | Fetch preferences one-by-one per component |
+| Debounce server mutation (800ms) | Fire a mutation on every keypress or drag event |
+| Define all preference keys as constants | Use raw strings for preference keys |
+| Define defaults in one place | Scatter default values across components |
+| Invalidate Redis after successful mutation | Read stale Redis after a write |
+| Keep `pref_value` as JSONB | Create a new DB column per preference field |
